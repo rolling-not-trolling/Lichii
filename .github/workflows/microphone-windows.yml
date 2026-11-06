@@ -1,0 +1,134 @@
+name: Microphone Windows build
+
+on:
+  push:
+    branches: [build/microphone-windows]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: microphone-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Build, test and package Windows
+    if: github.repository == 'rolling-not-trolling/Lichii'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up MSYS2 and dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            git make autoconf libtool automake-wrapper jq patch unzip
+          pacboy: >-
+            gcc:p clang:p lld:p cmake:p ninja:p python-pip:p ccache:p
+            qt6-base:p qt6-charts:p qt6-tools:p qt6-svg:p
+            openssl:p vulkan-memory-allocator:p vulkan-headers:p vulkan-loader:p
+            vulkan-utility-libraries:p glslang:p boost:p fmt:p lz4:p
+            nlohmann-json:p zlib:p zstd:p enet:p opus:p libusb:p sdl3:p ffmpeg:p catch:p
+
+      - name: Restore dependency and compiler caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: microphone-windows-${{ hashFiles('cpmfile.json', 'CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            microphone-windows-${{ hashFiles('cpmfile.json', 'CMakeLists.txt') }}-
+            microphone-windows-
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          export CCACHE_DIR="$(cygpath -m "$PWD/.ccache")"
+          ccache --max-size=2G
+          cmake -S . -B build/windows -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_PREFIX_PATH="$(cygpath -m /ucrt64)" \
+            -DENABLE_QT=ON -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_USE_BUNDLED_FFMPEG=OFF -DYUZU_USE_BUNDLED_SDL3=OFF \
+            -DYUZU_USE_BUNDLED_OPENSSL=OFF -DYUZU_USE_BUNDLED_SIRIT=OFF \
+            -DBUILD_TESTING=ON -DYUZU_TESTS=ON -DDYNARMIC_TESTS=OFF \
+            -DYUZU_CMD=OFF -DYUZU_ROOM=OFF -DYUZU_ROOM_STANDALONE=OFF \
+            -DENABLE_WERROR=OFF -DUSE_DISCORD_PRESENCE=OFF \
+            -DENABLE_UPDATE_CHECKER=OFF -DUSE_FASTER_LINKER=ON -DUSE_CCACHE=ON
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          export CCACHE_DIR="$(cygpath -m "$PWD/.ccache")"
+          cmake --build build/windows --target yuzu tests --parallel 4
+
+      - name: Run audio regression tests
+        run: |
+          set -euo pipefail
+          mkdir -p build/windows/tmp
+          export TEMP="$(cygpath -m "$PWD/build/windows/tmp")"
+          export TMP="$TEMP" TMPDIR="$TEMP"
+          build/windows/bin/tests.exe '*Microphone*,*Audio input*,[sysmix],[sysmix_sink]'
+
+      - name: Collect runtime DLLs
+        run: |
+          set -euo pipefail
+          cd build/windows/bin
+          test -f lichii.exe
+          binaries=()
+          while IFS= read -r -d '' binary; do
+            binaries+=("$binary")
+          done < <(find . -type f \( -name '*.exe' -o -name '*.dll' \) -print0)
+          for ((index = 0; index < ${#binaries[@]}; ++index)); do
+            while IFS= read -r dll; do
+              if [[ ! -f "$dll" && -f "/ucrt64/bin/$dll" ]]; then
+                cp -- "/ucrt64/bin/$dll" .
+                binaries+=("./$dll")
+              fi
+            done < <(objdump -p "${binaries[index]}" | awk '/DLL Name:/ {print $3}')
+          done
+
+      - name: Create Windows ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/package | Out-Null
+          Copy-Item build/windows/bin/* build/package -Recurse -Exclude tests.exe
+          Compress-Archive -Path build/package/* -DestinationPath lichii-microphone-windows-x86_64.zip
+
+      - name: Upload downloadable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-microphone-windows-x86_64
+          path: lichii-microphone-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish fork release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "microphone-windows-${{ github.run_number }}"
+          $notes = @"
+          Windows x86_64 build with microphone capture and Controls configuration.
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          Built with Clang/LLD; includes runtime DLLs. Extract the ZIP and run lichii.exe.
+          This is a testing build published by this fork.
+          "@
+          $notes | Set-Content -Encoding utf8 build/release-notes.md
+          gh release create $tag lichii-microphone-windows-x86_64.zip --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title "Lichii microphone Windows build ${{ github.run_number }}" --notes-file build/release-notes.md
