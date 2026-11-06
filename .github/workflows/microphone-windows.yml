@@ -102,12 +102,40 @@ jobs:
             done < <(objdump -p "${binaries[index]}" | awk '/DLL Name:/ {print $3}')
           done
 
+      - name: Build Qt platform smoke test
+        run: |
+          set -euo pipefail
+          clang++ -std=c++20 tools/windows/qt_platform_smoke.cpp \
+            -o build/windows/qt-platform-smoke.exe -fuse-ld=lld \
+            $(pkg-config --cflags --libs Qt6Gui Qt6Core)
+
       - name: Create Windows ZIP
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force build/package | Out-Null
           Copy-Item build/windows/bin/* build/package -Recurse -Exclude tests.exe
+          "[Paths]`nPrefix=.`nPlugins=plugins`n" | Set-Content -Encoding ascii build/package/qt.conf
           Compress-Archive -Path build/package/* -DestinationPath lichii-microphone-windows-x86_64.zip
+
+      - name: Smoke-test Qt from the extracted ZIP
+        shell: pwsh
+        run: |
+          Expand-Archive lichii-microphone-windows-x86_64.zip -DestinationPath build/smoke-unpacked -Force
+          Copy-Item build/windows/qt-platform-smoke.exe build/smoke-unpacked/
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          foreach ($name in 'QT_PLUGIN_PATH', 'QT_QPA_PLATFORM_PLUGIN_PATH', 'QT_QPA_PLATFORM', 'QTDIR') {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+          }
+          $env:QT_DEBUG_PLUGINS = '1'
+          $probe = Start-Process -FilePath (Resolve-Path build/smoke-unpacked/qt-platform-smoke.exe) -WindowStyle Hidden -PassThru -RedirectStandardOutput build/qt-platform.stdout.log -RedirectStandardError build/qt-platform.stderr.log
+          if (-not $probe.WaitForExit(30000)) {
+            $probe.Kill()
+            throw 'Packaged Qt platform initialization timed out'
+          }
+          $probe.WaitForExit()
+          Get-Content build/qt-platform.stdout.log
+          Get-Content build/qt-platform.stderr.log
+          if ($probe.ExitCode -ne 0) { throw 'Packaged Qt platform initialization failed' }
 
       - name: Upload downloadable build
         uses: actions/upload-artifact@v4
